@@ -34,33 +34,43 @@ class VerySimple(nn.Module):
 
 class Simple(nn.Module):
 
-    def __init__(self, input_dim, output_dim, num_task, mode='shared', l1_dim=1024, l2_dim=256, num_f=None,
-                 temperature=0.01):
+    def __init__(self, input_dim, output_dim, num_task, mode='shared', l1_dim=1024, l2_dim=256, var_size=None,
+                 num_f=None,
+                 temperature=0.01, bias=True):
         super().__init__()
 
+        if var_size is None:
+            var_size = [2048, 64, 1]
+
+        self.mode = mode
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.num_task = num_task
 
         if mode == 'shared':
-            self.l1 = LinearShared(input_dim, l1_dim, num_task)
-            self.l2 = LinearShared(l1_dim, l2_dim, num_task)
-            self.l2 = LinearShared(l2_dim, output_dim, num_task)
+            self.l1 = LinearShared(input_dim, l1_dim, num_task, bias=bias)
+            self.l2 = LinearShared(l1_dim, l2_dim, num_task, bias=bias)
+            self.l2 = LinearShared(l2_dim, output_dim, num_task, bias=bias)
 
         elif mode == 'independent':
-            self.l1 = LinearIndependent(input_dim, l1_dim, num_task)
-            self.l2 = LinearIndependent(l1_dim, l2_dim, num_task)
-            self.l3 = LinearIndependent(l2_dim, output_dim, num_task)
+            self.l1 = LinearIndependent(input_dim, l1_dim, num_task, bias=bias)
+            self.l2 = LinearIndependent(l1_dim, l2_dim, num_task, bias=bias)
+            self.l3 = LinearIndependent(l2_dim, output_dim, num_task, bias=bias)
 
         elif mode == 'rps':
-            self.l1 = LinearRPS(input_dim, l1_dim, num_task, num_f=num_f, temperature=temperature)
-            self.l2 = LinearRPS(l1_dim, l2_dim, num_task, num_f=num_f, temperature=temperature)
-            self.l3 = LinearRPS(l2_dim, output_dim, num_task, num_f=num_f, temperature=temperature)
+            self.l1 = LinearRPS(input_dim, l1_dim, num_task, num_f=num_f, temperature=temperature, bias=bias)
+            self.l2 = LinearRPS(l1_dim, l2_dim, num_task, num_f=num_f, temperature=temperature, bias=bias)
+            self.l3 = LinearRPS(l2_dim, output_dim, num_task, num_f=num_f, temperature=temperature, bias=bias)
 
         elif mode == 'pps':
-            self.l1 = LinearPps(input_dim, l1_dim, num_task, num_cat=num_f, var_size=1024, temperature=temperature)
-            self.l2 = LinearPps(l1_dim, l2_dim, num_task, num_cat=num_f, var_size=32, temperature=temperature)
-            self.l3 = LinearPps(l2_dim, output_dim, num_task, num_cat=num_f, var_size=8, temperature=temperature)
+            self.l1 = LinearPps(input_dim, l1_dim, num_task, num_cat=num_f, var_size=var_size[0], bias=bias,
+                                temperature=temperature,
+                                )
+            self.l2 = LinearPps(l1_dim, l2_dim, num_task, num_cat=num_f, var_size=var_size[1], temperature=temperature,
+                                bias=bias)
+            self.l3 = LinearPps(l2_dim, output_dim, num_task, num_cat=num_f, var_size=var_size[2],
+                                temperature=temperature,
+                                bias=bias)
 
         else:
             raise Exception('undefined mode!')
@@ -73,12 +83,24 @@ class Simple(nn.Module):
         n, input_dim = input.shape
         x = input.unsqueeze(1).expand(n, self.num_task, input_dim)
 
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        x = self.l3(x)
+        losses = 0
+
+        if self.mode == 'pps':
+            x, loss1 = self.l1(x)
+            x = F.relu(x)
+            x, loss2 = self.l2(x)
+            x = F.relu(x)
+            x, loss3 = self.l3(x)
+
+            losses = loss1 + loss2 + loss3
+
+        else:
+            x = F.relu(self.l1(x))
+            x = F.relu(self.l2(x))
+            x = self.l3(x)
 
         # (n, num_task, out)
-        return x
+        return x, losses
 
 
 class LinearShared(nn.Module):
@@ -277,7 +299,6 @@ class LinearPps(nn.Module):
         # the weights in pps lienar layers are all flattened, and then reshaped later if needed.
         self.weight = nn.Parameter(torch.Tensor(self.num_vars, self.var_size, self.num_cat))
 
-        self.bias = None
         if bias:
             self.bias = nn.Parameter(torch.Tensor(self.num_vars, self.num_cat, self.out_features))
         else:
@@ -310,7 +331,7 @@ class LinearPps(nn.Module):
         scores = (self.dist_probs + gumbels) / self.temperature
         return (scores - scores.logsumexp(dim=-1, keepdim=True)).exp()
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor) -> (torch.Tensor, torch.Tensor):
 
         # Inputs:
         # input (N, T, I)
@@ -330,11 +351,15 @@ class LinearPps(nn.Module):
         # (T, num_vars, C) -> (T, num_vars, var_size, C)
         vars_onehot_exp = vars_onehot.unsqueeze(-2).expand(-1, -1, self.var_size, -1)
 
+        # print(vars_onehot_exp.shape)
+
         # (T, num_vars, var_size, C) * (1, num_vars, var_size, C) -> (T, num_vars, var_size, C)
         sampled_weight = vars_onehot_exp * self.weight.unsqueeze(0)
 
         # (T, num_vars, var_size, C) -> (T, num_features)
         sampled_weight = torch.sum(sampled_weight, dim=-1).view(num_tasks, -1)
+
+        # sampled_weight = torch.einsum('tvsc,vsc->tvs', vars_onehot_exp, self.weight).view(num_tasks, -1)
 
         # Permute the sampled_weight
         # (T, num_features) -> (T, num_features)
@@ -357,5 +382,15 @@ class LinearPps(nn.Module):
 
             output = output + sampled_bias
 
+        # make weights orthogonal. calculate loss
+        # (num_vars, C, var_size) * (num_vars, var_size, C) *  -> (num_vars, C, C)
+        dp = torch.bmm(self.weight.transpose(1, 2), self.weight)
+        # print(torch.diag_embed(dp, dim1=-2, dim2=-1).shape)
+
+        dp = dp - torch.diag_embed(torch.diagonal(dp, dim1=-2, dim2=-1))
+        dp = torch.norm(dp, dim=[1, 2])
+
+        loss = torch.sum(dp)
+
         # (N, T, out_features)
-        return output
+        return output, loss

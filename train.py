@@ -16,10 +16,10 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 def main():
     parser = argparse.ArgumentParser(description='Relational Parameter Sharing')
-    parser.add_argument('-l', '--log', help='Description for foo argument', action='store_false')
+    parser.add_argument('-l', '--log', help='Description for foo argument', action='store_true')
     args = parser.parse_args()
 
-    batch_size = 512
+    batch_size = 256
 
     l1_dim = 128
     l2_dim = 32
@@ -28,29 +28,39 @@ def main():
     mode = 'pps'
     lr = 5e-4
     num_f = 5
-    num_epoch = 100
+    num_epoch = 1000
     temperature = 0.1
+    use_bias = False
     save_model = False
     run = None
+    ortho_loss_weight = 0.1
+
+    var_size = [2048, 64, 1]
 
     input_size = 32 * 96  # 3072
-    #
-    # if args.log:
-    #     run = wandb.init(project="relational-parameter-sharing",
-    #                      entity="ingim",
-    #                      save_code=True,
-    #                      config={
-    #                          'mode': mode,
-    #                          "learning_rate": lr,
-    #                          "num_epoch": num_epoch,
-    #                          "batch_size": batch_size,
-    #                          "num_f": num_f,
-    #                          "l1_dim": l1_dim,
-    #                          "l2_dim": l2_dim,
-    #                          "temperature": temperature
-    #                      })
 
-    baseline = model.Simple(input_size, 1, 10, mode=mode, num_f=num_f, l1_dim=l1_dim, l2_dim=l2_dim,
+    if args.log:
+        run = wandb.init(project="probabilistic-parameter-sharing",
+                         entity="ingim",
+                         save_code=True,
+                         config={
+                             'mode': mode,
+                             "learning_rate": lr,
+                             "num_epoch": num_epoch,
+                             "batch_size": batch_size,
+                             "num_f": num_f,
+                             "l1_dim": l1_dim,
+                             "l2_dim": l2_dim,
+                             "var_size": var_size,
+                             "ortho_loss_weight": ortho_loss_weight,
+                             "use_bias": use_bias,
+                             "save_model": save_model,
+                             "input_size": input_size,
+                             "temperature": temperature
+                         })
+
+    baseline = model.Simple(input_size, 1, 10, mode=mode, num_f=num_f, l1_dim=l1_dim, l2_dim=l2_dim, var_size=var_size,
+                            bias=use_bias,
                             temperature=temperature).cuda()
 
     # baseline = model.VerySimple(7056, 10).cuda()
@@ -95,12 +105,12 @@ def main():
             img = torch.flatten(img, start_dim=1)
 
             # (n, in) -> (n, num_task, out)
-            logits = baseline(img)
+            logits, ortho_loss = baseline(img)
 
             # (n, num_task, out) = (n, num_task, 1) -> (n, num_task)
             # logits.squeeze(-1)
 
-            loss = criterion(logits.squeeze(-1), target)
+            loss = criterion(logits.squeeze(-1), target) + ortho_loss_weight * ortho_loss
             loss.backward()
 
             # calculate metrics
@@ -121,15 +131,15 @@ def main():
             avg_precision += train_precision
             avg_recall += train_recall
             avg_f1 += train_f1
-            #
-            # if args.log:
-            #     wandb.log({
-            #         "train_loss": loss.item(),
-            #         "train_accuracy": train_accuracy,
-            #         "train_precision": train_precision,
-            #         "train_recall": train_recall,
-            #         "train_f1_score": train_f1
-            #     })
+
+            if args.log:
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "train_accuracy": train_accuracy,
+                    "train_precision": train_precision,
+                    "train_recall": train_recall,
+                    "train_f1_score": train_f1,
+                })
 
         avg_loss /= total_samples
         avg_acc /= total_samples
@@ -160,12 +170,12 @@ def main():
                 img = torch.flatten(img, start_dim=1)
 
                 # (n, in) -> (n, num_task, out)
-                logits = baseline(img)
+                logits, ortho_loss = baseline(img)
 
                 # (n, num_task, out) = (n, num_task, 1) -> (n, num_task)
                 # logits.squeeze(-1)
 
-                loss = criterion(logits.squeeze(-1), target)
+                loss = criterion(logits.squeeze(-1), target) + ortho_loss_weight * ortho_loss
 
                 # calculate metrics
                 preds = torch.round(torch.sigmoid(logits.squeeze(-1)))
@@ -191,14 +201,14 @@ def main():
 
             print(
                 f'[Validation] loss: {avg_loss}, accuracy: {avg_acc}, precision: {avg_precision}, recall: {avg_recall}, f1: {avg_f1}')
-            # if args.log:
-            #     wandb.log({
-            #         "val_loss": avg_loss,
-            #         "val_accuracy": avg_acc,
-            #         "val_precision": avg_precision,
-            #         "val_recall": avg_recall,
-            #         "val_f1_score": avg_f1
-            #     })
+            if args.log:
+                wandb.log({
+                    "val_loss": avg_loss,
+                    "val_accuracy": avg_acc,
+                    "val_precision": avg_precision,
+                    "val_recall": avg_recall,
+                    "val_f1_score": avg_f1
+                })
 
         if save_model and args.log:
             torch.save(baseline.state_dict(), f'./checkpoint/{run.name}_{epoch}.pt')
