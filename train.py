@@ -19,7 +19,7 @@ def main():
     parser.add_argument('-l', '--log', help='Description for foo argument', action='store_false')
     args = parser.parse_args()
 
-    batch_size = 96
+    batch_size = 512
 
     l1_dim = 128
     l2_dim = 32
@@ -29,7 +29,7 @@ def main():
     lr = 5e-4
     num_f = 5
     num_epoch = 100
-    temperature = 0.01
+    temperature = 0.1
     save_model = False
     run = None
 

@@ -45,7 +45,7 @@ class Simple(nn.Module):
         if mode == 'shared':
             self.l1 = LinearShared(input_dim, l1_dim, num_task)
             self.l2 = LinearShared(l1_dim, l2_dim, num_task)
-            self.l3 = LinearIndependent(l2_dim, output_dim, num_task)
+            self.l2 = LinearShared(l2_dim, output_dim, num_task)
 
         elif mode == 'independent':
             self.l1 = LinearIndependent(input_dim, l1_dim, num_task)
@@ -55,7 +55,7 @@ class Simple(nn.Module):
         elif mode == 'rps':
             self.l1 = LinearRPS(input_dim, l1_dim, num_task, num_f=num_f, temperature=temperature)
             self.l2 = LinearRPS(l1_dim, l2_dim, num_task, num_f=num_f, temperature=temperature)
-            self.l3 = LinearIndependent(l2_dim, output_dim, num_task, num_task)
+            self.l3 = LinearRPS(l2_dim, output_dim, num_task, num_f=num_f, temperature=temperature)
 
         elif mode == 'pps':
             self.l1 = LinearPps(input_dim, l1_dim, num_task, num_cat=num_f, var_size=1024, temperature=temperature)
@@ -285,11 +285,13 @@ class LinearPps(nn.Module):
 
         # used for permuting the weight matrix in a deterministic way. Later used for scatter operation
         self.perm_pattern = torch.randperm(self.num_features).cuda()
+        self.eps = torch.finfo(torch.float32).eps
 
         self.init_params()
         # self.dist = dist.RelaxedOneHotCategorical(temperature, probs=self.rel)
 
-        print(f'Number of variables: {self.num_vars}, variable size: {self.var_size}, number of categories: {self.num_cat}')
+        print(
+            f'Number of variables: {self.num_vars}, variable size: {self.var_size}, number of categories: {self.num_cat}')
 
     def init_params(self):
 
@@ -299,52 +301,59 @@ class LinearPps(nn.Module):
         if self.bias is not None:
             nn.init.constant_(self.bias, 0)
 
+    def sample_weights(self):
+
+        uniforms = torch.rand_like(self.dist_probs)  # torch.rand(shape + list(self.dist_probs.shape), device='cuda')
+        uniforms = torch.clamp(uniforms, min=self.eps, max=1 - self.eps)
+
+        gumbels = -((-(uniforms.log())).log())
+        scores = (self.dist_probs + gumbels) / self.temperature
+        return (scores - scores.logsumexp(dim=-1, keepdim=True)).exp()
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
 
         # Inputs:
         # input (N, T, I)
-        batch_size = input.shape[0]
         num_tasks = input.shape[1]
 
         assert num_tasks == self.num_tasks
 
         # Sample from relaxed categorical distribution
-        dist = torch.distributions.relaxed_categorical.RelaxedOneHotCategorical(
-            self.temperature, logits=self.dist_probs, validate_args=False)
+        # dist = torch.distributions.relaxed_categorical.RelaxedOneHotCategorical(
+        #     self.temperature, logits=self.dist_probs, validate_args=False)
 
         # Generate one-hot vectors
-        # (N, T, num_vars, C)
-        vars_onehot = dist.rsample(torch.Size([batch_size]))
+        # (T, num_vars, C)
+        vars_onehot = self.sample_weights()  # dist.rsample()
 
         # Expand and reshape one-hot vectors
-        # (N, T, num_vars, C) -> (N, T, num_vars, var_size, C)
-        vars_onehot_exp = vars_onehot \
-            .unsqueeze(-2).expand(-1, -1, -1, self.var_size, -1)
+        # (T, num_vars, C) -> (T, num_vars, var_size, C)
+        vars_onehot_exp = vars_onehot.unsqueeze(-2).expand(-1, -1, self.var_size, -1)
 
-        # (N, T, num_vars, var_size, C) * (1, 1, num_vars, var_size, C) -> (N, T, num_vars, var_size, C)
-        sampled_weight = vars_onehot_exp * self.weight.unsqueeze(0).unsqueeze(0)
+        # (T, num_vars, var_size, C) * (1, num_vars, var_size, C) -> (T, num_vars, var_size, C)
+        sampled_weight = vars_onehot_exp * self.weight.unsqueeze(0)
 
-        # (N, T, num_vars, var_size, C) -> (N, T, num_features)
-        sampled_weight = torch.sum(sampled_weight, dim=-1).view(batch_size, num_tasks, -1)
+        # (T, num_vars, var_size, C) -> (T, num_features)
+        sampled_weight = torch.sum(sampled_weight, dim=-1).view(num_tasks, -1)
 
         # Permute the sampled_weight
-        # (N, T, num_features) -> (N, T, num_features)
+        # (T, num_features) -> (T, num_features)
         sampled_weight = torch.index_select(sampled_weight, dim=-1, index=self.perm_pattern)
 
         # now we need to reshape the sampled_weight
-        # (N, T, num_features) -> (N, T, in_features, out_features)
-        sampled_weight = sampled_weight.view(batch_size, num_tasks, self.in_features, self.out_features)
+        # (T, num_features) -> (T, in_features, out_features)
+        sampled_weight = sampled_weight.view(num_tasks, self.in_features, self.out_features)
 
-        # (N, T, in_features) @ (N, T, in_features, out_features) -> (N, T, out_features)
-        output = torch.einsum('nti,ntio->nto', input, sampled_weight)
+        # (N, T, in_features) @ (T, in_features, out_features) -> (N, T, out_features)
+        output = torch.einsum('nti,tio->nto', input, sampled_weight)
 
         # Sample bias if bias is enabled
         # bias is linear, so we just add all sampled variables together
         if self.bias is not None:
-            # (N, T, num_vars, C, 1) * (1, 1, num_vars, C, out_feature) -> (N, T, num_vars, C, out_features)
-            sampled_bias = vars_onehot.unsqueeze(-1) * self.bias.unsqueeze(0).unsqueeze(0)
-            # (N, T, num_vars, C, out_features)  -> (N, T, out_features)
-            sampled_bias = torch.sum(sampled_bias, dim=(2, 3))
+            # (T, num_vars, C, 1) * (1, num_vars, C, out_feature) -> (T, num_vars, C, out_features)
+            sampled_bias = vars_onehot.unsqueeze(-1) * self.bias.unsqueeze(0)
+            # (T, num_vars, C, out_features)  -> (T, out_features)
+            sampled_bias = torch.sum(sampled_bias, dim=(1, 2))
 
             output = output + sampled_bias
 
