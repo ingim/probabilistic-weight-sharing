@@ -25,7 +25,7 @@ def main():
     l2_dim = 32
 
     batch_size_test = batch_size
-    mode = 'pps'
+    mode = 'shared'
     lr = 5e-4
     num_f = 5
     num_epoch = 1000

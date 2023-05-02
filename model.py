@@ -50,7 +50,8 @@ class Simple(nn.Module):
         if mode == 'shared':
             self.l1 = LinearShared(input_dim, l1_dim, num_task, bias=bias)
             self.l2 = LinearShared(l1_dim, l2_dim, num_task, bias=bias)
-            self.l2 = LinearShared(l2_dim, output_dim, num_task, bias=bias)
+            #self.l3 = LinearShared(l2_dim, output_dim, num_task, bias=bias)
+            self.l3 = LinearIndependent(l2_dim, output_dim, num_task, bias=bias)
 
         elif mode == 'independent':
             self.l1 = LinearIndependent(input_dim, l1_dim, num_task, bias=bias)
@@ -91,7 +92,6 @@ class Simple(nn.Module):
             x, loss2 = self.l2(x)
             x = F.relu(x)
             x, loss3 = self.l3(x)
-
             losses = loss1 + loss2 + loss3
 
         else:
@@ -133,6 +133,7 @@ class LinearShared(nn.Module):
         # x = torch.tensordot(input, self.weight, dims=([2], [1]))
 
         # (out, in) @ (n, num_task, in) -> (n, num_task, out)
+        #print(input.shape, self.weight.shape)
         x = torch.einsum('nti,ji->ntj', input, self.weight)
 
         if self.bias is not None:
@@ -388,9 +389,7 @@ class LinearPps(nn.Module):
         # print(torch.diag_embed(dp, dim1=-2, dim2=-1).shape)
 
         dp = dp - torch.diag_embed(torch.diagonal(dp, dim1=-2, dim2=-1))
-        dp = torch.norm(dp, dim=[1, 2])
-
-        loss = torch.sum(dp)
+        loss = torch.sum(dp ** 2)
 
         # (N, T, out_features)
         return output, loss
