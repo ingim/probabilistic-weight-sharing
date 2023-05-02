@@ -25,15 +25,15 @@ def main():
     l2_dim = 32
 
     batch_size_test = batch_size
-    mode = 'shared'
+    mode = 'pps'
     lr = 5e-4
     num_f = 5
     num_epoch = 1000
-    temperature = 0.1
+    temperature = 0.05
     use_bias = False
-    save_model = False
+    save_model = True
     run = None
-    ortho_loss_weight = 0.1
+    ortho_loss_weight = 0.3
 
     var_size = [2048, 64, 1]
 
