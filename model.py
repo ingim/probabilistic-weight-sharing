@@ -50,7 +50,7 @@ class Simple(nn.Module):
         if mode == 'shared':
             self.l1 = LinearShared(input_dim, l1_dim, num_task, bias=bias)
             self.l2 = LinearShared(l1_dim, l2_dim, num_task, bias=bias)
-            #self.l3 = LinearShared(l2_dim, output_dim, num_task, bias=bias)
+            # self.l3 = LinearShared(l2_dim, output_dim, num_task, bias=bias)
             self.l3 = LinearIndependent(l2_dim, output_dim, num_task, bias=bias)
 
         elif mode == 'independent':
@@ -133,7 +133,7 @@ class LinearShared(nn.Module):
         # x = torch.tensordot(input, self.weight, dims=([2], [1]))
 
         # (out, in) @ (n, num_task, in) -> (n, num_task, out)
-        #print(input.shape, self.weight.shape)
+        # print(input.shape, self.weight.shape)
         x = torch.einsum('nti,ji->ntj', input, self.weight)
 
         if self.bias is not None:
@@ -307,6 +307,20 @@ class LinearPps(nn.Module):
 
         # used for permuting the weight matrix in a deterministic way. Later used for scatter operation
         self.perm_pattern = torch.randperm(self.num_features).cuda()
+
+        # create a counting vector (num_vars, out_features) for bias
+
+        # (out_features, in_features)
+        idx_map = torch.floor_divide(self.perm_pattern, self.var_size) \
+            .view(in_features, out_features) \
+            .transpose(0, 1)
+
+        # Create a histogram of the indices of the variables
+        # (out_features, in_features) -> (out_features, in_features, num_vars) -> (out_features, num_vars) -> (num_vars, out_features)
+        self.counting_vec = torch.nn.functional.one_hot(idx_map, self.num_vars) \
+            .sum(dim=-2) \
+            .transpose(0, 1)
+
         self.eps = torch.finfo(torch.float32).eps
 
         self.init_params()
@@ -378,10 +392,15 @@ class LinearPps(nn.Module):
         if self.bias is not None:
             # (T, num_vars, C, 1) * (1, num_vars, C, out_feature) -> (T, num_vars, C, out_features)
             sampled_bias = vars_onehot.unsqueeze(-1) * self.bias.unsqueeze(0)
+
+            # multiply histogram
+            # (T, num_vars, C, out_features) * (1, num_vars, 1, out_features) -> (T, num_vars, C, out_features)
+            sampled_bias = sampled_bias * self.counting_vec.unsqueeze(0).unsqueeze(-2)
+
             # (T, num_vars, C, out_features)  -> (T, out_features)
             sampled_bias = torch.sum(sampled_bias, dim=(1, 2))
 
-            output = output + sampled_bias
+            output = output + sampled_bias / self.in_features
 
         # make weights orthogonal. calculate loss
         # (num_vars, C, var_size) * (num_vars, var_size, C) *  -> (num_vars, C, C)

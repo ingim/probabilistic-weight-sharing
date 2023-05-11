@@ -30,8 +30,8 @@ def main():
     num_f = 5
     num_epoch = 1000
     temperature = 0.05
-    use_bias = False
-    save_model = True
+    use_bias = True
+    save_model = False
     run = None
     ortho_loss_weight = 0.3
 
